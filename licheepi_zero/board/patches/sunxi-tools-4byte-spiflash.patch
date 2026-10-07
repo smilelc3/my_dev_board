@@ -1,0 +1,133 @@
+--- a/fel-spiflash.c	2026-09-27 05:47:29.759637278 +0800
++++ b/fel-spiflash.c	2026-09-27 05:50:47.594641102 +0800
+@@ -65,6 +65,48 @@
+ };
+ 
+ /*****************************************************************************/
++/*
++ * 本地补丁：32 MiB SPI NOR（Macronix MX25L25645G）的 4 字节地址支持
++ *
++ * 上游 sunxi-fel 的 spiflash 读写只发 3 字节地址（24 bit = 16 MiB），
++ * 超过 16 MiB 会静默回绕、覆盖前面的数据（Sipeed 的 wiki 也讲了这个问题，
++ * 他们的做法是照 U-Boot 的 CONFIG_SPI_FLASH_BAR，用 WREAR(0xC5) 切 bank）。
++ *
++ * 这里改成用"专用 4 字节 opcode"：0x13(4READ) / 0x12(4PP) / 0x21(4SE) / 0xDC(4BE)。
++ * 好处是这些命令自带 4 字节地址，**不改变芯片任何状态** —— 既不用 EN4B(0xB7)
++ * 也不用写 EAR/bank 寄存器，所以烧完复位后 BROM 用 3 字节地址照样能读到偏移 0 的
++ * eGON 头，不会出现"必须断电才能恢复"的情况（内核/U-Boot 里我们也是这么做的）。
++ */
++#define SPI_FLASH_16MB 0x1000000
++
++static uint8_t opcode_4b(uint8_t cmd)
++{
++	switch (cmd) {
++	case 0x03: return 0x13;   /* READ  -> 4READ */
++	case 0x02: return 0x12;   /* PP    -> 4PP   */
++	case 0x20: return 0x21;   /* SE    -> 4SE   */
++	case 0xD8: return 0xDC;   /* BE    -> 4BE   */
++	default:   return cmd;
++	}
++}
++
++/* 地址几个字节：低 16 MiB 用 3 字节（兼容所有芯片），再往上是 4 字节 */
++static size_t addr_bytes(uint32_t offset)
++{
++	return offset >= SPI_FLASH_16MB ? 4 : 3;
++}
++
++static size_t emit_addr(uint8_t *buf, size_t idx, uint32_t offset, size_t n)
++{
++	if (n == 4)
++		buf[idx++] = offset >> 24;
++	buf[idx++] = offset >> 16;
++	buf[idx++] = offset >> 8;
++	buf[idx++] = offset;
++	return idx;
++}
++
++/*****************************************************************************/
+ 
+ uint32_t fel_readl(feldev_handle *dev, uint32_t addr);
+ void fel_writel(feldev_handle *dev, uint32_t addr, uint32_t val);
+@@ -394,24 +436,29 @@
+ 
+ 	progress_start(progress, len);
+ 	while (len > 0) {
++		size_t alen = addr_bytes(offset);        /* 3 或 4（本地补丁） */
++		size_t cmd_len = 1 + alen;               /* opcode + 地址 */
++		size_t overhead = 2 + cmd_len + 2;       /* 长度字段 + 命令 + 结束码 */
+ 		size_t chunk_size = len;
+-		if (chunk_size > max_chunk_size - 8)
+-			chunk_size = max_chunk_size - 8;
++		if (chunk_size > max_chunk_size - overhead)
++			chunk_size = max_chunk_size - overhead;
+ 
+ 		memset(cmdbuf, 0, max_chunk_size);
+-		cmdbuf[0] = (chunk_size + 4) >> 8;
+-		cmdbuf[1] = (chunk_size + 4);
+-		cmdbuf[2] = 3;
+-		cmdbuf[3] = offset >> 16;
+-		cmdbuf[4] = offset >> 8;
+-		cmdbuf[5] = offset;
++		cmdbuf[0] = (chunk_size + cmd_len) >> 8;
++		cmdbuf[1] = (chunk_size + cmd_len);
++		cmdbuf[2] = alen == 4 ? opcode_4b(0x03) : 0x03;
++		{
++			size_t i = emit_addr(cmdbuf, 3, offset, alen);
++			(void)i;
++		}
+ 
+-		if (chunk_size == max_chunk_size - 8)
+-			aw_fel_write(dev, cmdbuf, soc_info->spl_addr, 6);
++		if (chunk_size == max_chunk_size - overhead)
++			aw_fel_write(dev, cmdbuf, soc_info->spl_addr, 2 + cmd_len);
+ 		else
+-			aw_fel_write(dev, cmdbuf, soc_info->spl_addr, chunk_size + 8);
++			aw_fel_write(dev, cmdbuf, soc_info->spl_addr, chunk_size + overhead);
+ 		aw_fel_remotefunc_execute(dev, NULL);
+-		aw_fel_read(dev, soc_info->spl_addr + 6, buf8, chunk_size);
++		/* 收到的数据紧跟在 [长度(2)+opcode+地址] 之后（本地补丁：3/4 字节地址都适配）*/
++		aw_fel_read(dev, soc_info->spl_addr + 2 + cmd_len, buf8, chunk_size);
+ 
+ 		len -= chunk_size;
+ 		offset += chunk_size;
+@@ -448,6 +495,7 @@
+ 
+ 	while (len > 0) {
+ 		while (len > 0 && max_chunk_size - cmd_idx > program_size + 64) {
++			size_t alen = addr_bytes(offset);   /* 本地补丁：3 或 4 字节地址 */
+ 			if (offset % erase_size == 0) {
+ 				/* Emit write enable command */
+ 				cmdbuf[cmd_idx++] = 0;
+@@ -455,11 +503,9 @@
+ 				cmdbuf[cmd_idx++] = CMD_WRITE_ENABLE;
+ 				/* Emit erase command */
+ 				cmdbuf[cmd_idx++] = 0;
+-				cmdbuf[cmd_idx++] = 4;
+-				cmdbuf[cmd_idx++] = erase_cmd;
+-				cmdbuf[cmd_idx++] = offset >> 16;
+-				cmdbuf[cmd_idx++] = offset >> 8;
+-				cmdbuf[cmd_idx++] = offset;
++				cmdbuf[cmd_idx++] = 1 + alen;
++				cmdbuf[cmd_idx++] = alen == 4 ? opcode_4b(erase_cmd) : erase_cmd;
++				cmd_idx = emit_addr(cmdbuf, cmd_idx, offset, alen);
+ 				/* Emit wait for completion */
+ 				cmdbuf[cmd_idx++] = 0xFF;
+ 				cmdbuf[cmd_idx++] = 0xFF;
+@@ -472,12 +518,10 @@
+ 			size_t write_count = program_size;
+ 			if (write_count > len)
+ 				write_count = len;
+-			cmdbuf[cmd_idx++] = (4 + write_count) >> 8;
+-			cmdbuf[cmd_idx++] = 4 + write_count;
+-			cmdbuf[cmd_idx++] = program_cmd;
+-			cmdbuf[cmd_idx++] = offset >> 16;
+-			cmdbuf[cmd_idx++] = offset >> 8;
+-			cmdbuf[cmd_idx++] = offset;
++			cmdbuf[cmd_idx++] = (1 + alen + write_count) >> 8;
++			cmdbuf[cmd_idx++] = 1 + alen + write_count;
++			cmdbuf[cmd_idx++] = alen == 4 ? opcode_4b(program_cmd) : program_cmd;
++			cmd_idx = emit_addr(cmdbuf, cmd_idx, offset, alen);
+ 			memcpy(cmdbuf + cmd_idx, buf8, write_count);
+ 			cmd_idx += write_count;
+ 			buf8    += write_count;

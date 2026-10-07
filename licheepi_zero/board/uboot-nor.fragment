@@ -1,0 +1,54 @@
+# LicheePi Zero Dock / V3s / 32 MiB SPI NOR —— U-Boot 配置片段
+# 基线 LicheePi_Zero_defconfig，由 03-uboot.sh 用 merge_config.sh 合并。
+# 注意：`# CONFIG_x is not set` 后面不能跟注释，否则整行被静默忽略。
+
+# 板级设备树（含 SPI NOR 分区，与内核共用同一份 dts）
+CONFIG_DEFAULT_DEVICE_TREE="allwinner/sun8i-v3s-licheepi-zero-dock"
+
+# ---- 启动流程 ----
+CONFIG_BOOTDELAY=2
+CONFIG_BOOTCOMMAND="setenv bootargs console=tty0 console=ttyS0,115200 console=ttyGS0,115200 earlycon panic=5 ubi.mtd=rootfs root=ubi0:rootfs rootfstype=ubifs rw rootwait; sf probe 0:0; sf read 0x41000000 0x100000 0x700000; sf read 0x41800000 0x800000 0x10000; bootz 0x41000000 - 0x41800000"
+
+# ---- SPI 控制器 / SPI NOR ----
+CONFIG_SPI=y
+CONFIG_DM_SPI=y
+CONFIG_SPI_SUNXI=y
+CONFIG_SPI_FLASH=y
+CONFIG_DM_SPI_FLASH=y
+CONFIG_SPI_FLASH_MACRONIX=y
+# >16 MiB 的 4 字节寻址走 SPI_NOR_4B_OPCODES（见 uboot-mx25l256-4b-opcodes.patch），
+# 不用 bank/EAR；U-Boot 不读 SFDP，开着也不参与这个决策。
+# CONFIG_SPI_FLASH_SFDP_SUPPORT is not set
+# CONFIG_SPI_FLASH_BAR is not set
+CONFIG_SF_DEFAULT_SPEED=25000000
+CONFIG_SF_DEFAULT_MODE=0
+CONFIG_SF_DEFAULT_BUS=0
+CONFIG_SF_DEFAULT_CS=0
+CONFIG_CMD_SF=y
+CONFIG_CMD_SPI=y
+
+# ---- MTD / 分区 ----
+CONFIG_MTD=y
+CONFIG_CMD_MTD=y
+CONFIG_CMD_MTDPARTS=y
+CONFIG_MTDIDS_DEFAULT="nor0=spi0.0"
+CONFIG_MTDPARTS_DEFAULT="mtdparts=spi0.0:1m(u-boot),7m(kernel),64k(dtb),24512k(rootfs)"
+
+# ---- SPL 从 SPI NOR 读取 U-Boot proper ----
+# 不要打开 DM 版 SPL_SPI / SPL_SPI_LOAD：会把 Driver Model 拉进 SPL 导致链接失败。
+CONFIG_SPL_SPI_SUNXI=y
+CONFIG_SYS_SPI_U_BOOT_OFFS=0x8000
+
+# ---- 环境变量：在 u-boot 分区尾部（0xF0000, 64 KiB），不单独分区 ----
+CONFIG_ENV_IS_IN_SPI_FLASH=y
+CONFIG_ENV_OFFSET=0xF0000
+CONFIG_ENV_SIZE=0x10000
+CONFIG_ENV_SECT_SIZE=0x1000
+CONFIG_CMD_SAVEENV=y
+CONFIG_CMD_ERASEENV=y
+
+# ---- 裁剪：不需要 UEFI/EFI capsule，避免引入 gnutls 依赖 ----
+# CONFIG_EFI_LOADER is not set
+# CONFIG_TOOLS_MKEFICAPSULE is not set
+# CONFIG_CMD_BOOTEFI is not set
+# CONFIG_CMD_BOOTEFI_HELLO is not set

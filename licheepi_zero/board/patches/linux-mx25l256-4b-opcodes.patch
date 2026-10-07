@@ -1,0 +1,13 @@
+--- a/drivers/mtd/spi-nor/macronix.c
++++ b/drivers/mtd/spi-nor/macronix.c
+@@ -134,8 +134,9 @@
+ 		.id = SNOR_ID(0xc2, 0x20, 0x18),
+ 		.flags = SPI_NOR_HAS_LOCK | SPI_NOR_4BIT_BP,
+ 	}, {
+-		/* MX25L25635E, MX25L25645G */
++		/* MX25L25635E/F、MX25L25645G：直接声明 4 字节 opcode，不走 EN4B */
+ 		.id = SNOR_ID(0xc2, 0x20, 0x19),
++		.fixup_flags = SPI_NOR_4B_OPCODES,
+ 		.fixups = &mx25l25635_fixups
+ 	}, {
+ 		/* MX66L51235F */

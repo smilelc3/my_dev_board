@@ -1,0 +1,153 @@
+/* ==== LICHEEPI-BOARD-FRAGMENT-BEGIN ==== */
+/*
+ * LicheePi Zero Dock 板级补充片段：SPI NOR 分区 + 4.3" RGB LCD + 触摸 + USB 从设备
+ *
+ * 由 scripts/02-dts.sh 做变量替换后追加到 U-Boot 与 Linux 两份 .dts 末尾
+ * （分区数值只在 board/layout.conf 定义一处），保证 bootloader 与内核看到的
+ * 分区布局完全一致。追加后 02-dts.sh 会逐字比对两份片段。
+ *
+ * 硬件（依据 Lichee Pi Zero 原理图）：
+ *   LCD      : 40P RGB666（PE0-PE19 + PE23/PE24），面板 QiaoDian QD43003C0-40 480x272
+ *   背光     : PWM0 / PB4
+ *   触摸     : NS2009 @ I2C0 0x48 —— 本板用不了（PENIRQ 没接到 SoC），节点 disabled
+ *   调试串口 : UART0 / PB8,PB9
+ */
+
+#include <dt-bindings/interrupt-controller/irq.h>
+
+&spi0 {
+	status = "okay";
+
+	flash@0 {
+		compatible = "jedec,spi-nor";
+		reg = <0>;
+		spi-max-frequency = <25000000>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/*
+			 * 故意不加 read-only：这样从 Linux 里也能重写引导区
+			 * （/usr/local/sbin/force-fel 擦掉 SPL 让板子回到 FEL 模式）。
+			 */
+			partition@@UBOOT_NODE@ {
+				label = "u-boot";
+				reg = <@UBOOT_OFF@ @UBOOT_SIZE@>;
+			};
+
+			partition@@KERNEL_NODE@ {
+				label = "kernel";
+				reg = <@KERNEL_OFF@ @KERNEL_SIZE@>;
+			};
+
+			partition@@DTB_NODE@ {
+				label = "dtb";
+				reg = <@DTB_OFF@ @DTB_SIZE@>;
+			};
+
+			partition@@ROOTFS_NODE@ {
+				label = "rootfs";
+				reg = <@ROOTFS_OFF@ @ROOTFS_SIZE@>;
+			};
+		};
+	};
+};
+
+/* ------------------------------------------------------------------ *
+ * 4.3 寸 480x272 RGB666 屏幕（DE -> mixer0 -> TCON0 -> panel）
+ * ------------------------------------------------------------------ */
+
+&pio {
+	lcd_rgb666_pins: lcd-rgb666-pins {
+		pins = "PE0", "PE1", "PE2", "PE3", "PE4", "PE5",
+		       "PE6", "PE7", "PE8", "PE9", "PE10", "PE11",
+		       "PE12", "PE13", "PE14", "PE15", "PE16", "PE17",
+		       "PE18", "PE19", "PE23", "PE24";
+		function = "lcd";
+	};
+};
+
+&de {
+	status = "okay";
+};
+
+&tcon0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&lcd_rgb666_pins>;
+	status = "okay";
+};
+
+&tcon0_out {
+	tcon0_out_lcd: endpoint@0 {
+		reg = <0>;
+		remote-endpoint = <&panel_input>;
+	};
+};
+
+&pwm {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pwm0_pin>;
+	status = "okay";
+};
+
+/ {
+	backlight: backlight {
+		compatible = "pwm-backlight";
+		/* PWM0 = PB4，Dock 上驱动背光升压电路；1 kHz */
+		pwms = <&pwm 0 1000000 0>;
+		brightness-levels = <0 10 20 30 40 55 75 100>;
+		default-brightness-level = <7>;
+	};
+
+	panel: panel {
+		compatible = "qiaodian,qd43003c0-40", "simple-panel";
+		backlight = <&backlight>;
+		power-supply = <&reg_vcc3v3>;
+
+		port {
+			panel_input: endpoint {
+				remote-endpoint = <&tcon0_out_lcd>;
+			};
+		};
+	};
+};
+
+/* ------------------------------------------------------------------ *
+ * 电阻触摸：NS2009（与 TI TSC2007 寄存器兼容）挂在 I2C0，地址 0x48
+ *
+ * 默认 **disabled**：这块板/屏的 PENIRQ 没有引到 SoC 上 ——
+ *   * Zero 原理图里 "PENIRQ" 只出现在 NS2009 一侧（第 4 页 3 处），
+ *     而 PB5 的网名是 IO2，跟 PENIRQ 不是一个网；
+ *   * 实测：手指反复点击，/proc/interrupts 里 tsc2007 的中断计数恒为 0；
+ *   * 主线 tsc2007 驱动必须有中断才会去读坐标（没有轮询模式），
+ *     所以节点即使 probe 成功也永远收不到事件。
+ * 另外 gpios/pendown-gpio 会"占用"PB5，而 PB5 实际另有用途，不该被声明。
+ *
+ * 若以后确认了 PENIRQ 到底接在哪个引脚，把 status 改成 "okay" 并填对
+ * interrupt-parent/interrupts（有些屏模块干脆没把 PENIRQ 引出，那就
+ * 只能在用户态轮询 NS2009：i2c0 @0x48，命令 0xC4=X / 0xD4=Y /
+ * 0xE4=Z1 / 0xF4=Z2，12bit 值 = swab16(word) >> 4）。
+ * ------------------------------------------------------------------ */
+
+&i2c0 {
+	status = "okay";
+
+	touchscreen@48 {
+		compatible = "ti,tsc2007";
+		reg = <0x48>;
+		status = "disabled";
+	};
+};
+
+/*
+ * OTG 口（micro-USB，接主机的那一个）固定为 USB 从设备：
+ * 用 g_serial 在该口提供 /dev/ttyACM0 控制台。
+ * 需要当主机用时改成 "otg" 或 "host" 并重新编译 DTB。
+ */
+&usb_otg {
+	dr_mode = "peripheral";
+};
+
+/* ==== LICHEEPI-BOARD-FRAGMENT-END ==== */
